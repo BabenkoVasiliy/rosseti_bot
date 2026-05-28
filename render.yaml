@@ -9,16 +9,3 @@ services:
         sync: false
       - key: PARSER_API_KEY
         sync: false
-
-  - type: cron
-    name: rosseti-parser
-    env: go
-    buildCommand: go build -o parser ./parser
-    startCommand: ./parser
-    scheduling:
-      minute: "*/15"
-    envVars:
-      - key: BOT_SERVICE_URL
-        sync: false
-      - key: PARSER_API_KEY
-        sync: false
