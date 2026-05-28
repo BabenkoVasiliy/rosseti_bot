@@ -1,4 +1,5 @@
 rosseti-bot
+parser/parser
 data.db
 data.db-shm
 data.db-wal
