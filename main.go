@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
 
@@ -44,12 +45,7 @@ type StreetsPayload struct {
 	Settlements []SettlementStreets `json:"settlements"`
 }
 
-const (
-	maxMsgLen  = 4096
-	targetRegion = "19"
-	targetRaion  = "Алтайский р-н"
-	targetGorod  = "д Кайбалы"
-)
+const maxMsgLen = 4096
 
 var (
 	recordsCache struct {
@@ -60,10 +56,59 @@ var (
 )
 
 func initDB() error {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn != "" {
+		return initPostgres(dsn)
+	}
+	return initSQLite()
+}
+
+func initPostgres(dsn string) error {
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		return fmt.Errorf("open postgres: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("ping postgres: %w", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS subscriptions (
+			id SERIAL PRIMARY KEY,
+			chat_id BIGINT NOT NULL,
+			street TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(chat_id, street)
+		);
+		CREATE TABLE IF NOT EXISTS sent_notifications (
+			id SERIAL PRIMARY KEY,
+			chat_id BIGINT NOT NULL,
+			outage_id TEXT NOT NULL,
+			street TEXT NOT NULL,
+			sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(chat_id, outage_id)
+		);
+		CREATE TABLE IF NOT EXISTS streets (
+			id SERIAL PRIMARY KEY,
+			region TEXT NOT NULL,
+			raion TEXT NOT NULL,
+			gorod TEXT NOT NULL,
+			street TEXT NOT NULL,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(region, raion, gorod, street)
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("init tables: %w", err)
+	}
+	return nil
+}
+
+func initSQLite() error {
 	var err error
 	db, err = sql.Open("sqlite", "data.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)")
 	if err != nil {
-		return fmt.Errorf("open db: %w", err)
+		return fmt.Errorf("open sqlite: %w", err)
 	}
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS subscriptions (
@@ -98,17 +143,17 @@ func initDB() error {
 }
 
 func addSubscription(chatID int64, street string) error {
-	_, err := db.Exec("INSERT OR IGNORE INTO subscriptions (chat_id, street) VALUES (?, ?)", chatID, street)
+	_, err := db.Exec("INSERT INTO subscriptions (chat_id, street) VALUES ($1, $2) ON CONFLICT DO NOTHING", chatID, street)
 	return err
 }
 
 func removeSubscription(chatID int64, street string) error {
-	_, err := db.Exec("DELETE FROM subscriptions WHERE chat_id = ? AND street = ?", chatID, street)
+	_, err := db.Exec("DELETE FROM subscriptions WHERE chat_id = $1 AND street = $2", chatID, street)
 	return err
 }
 
 func getSubscriptions(chatID int64) ([]string, error) {
-	rows, err := db.Query("SELECT street FROM subscriptions WHERE chat_id = ? ORDER BY street", chatID)
+	rows, err := db.Query("SELECT street FROM subscriptions WHERE chat_id = $1 ORDER BY street", chatID)
 	if err != nil {
 		return nil, err
 	}
@@ -144,12 +189,12 @@ func getAllSubscriptions() (map[int64][]string, error) {
 
 func isSent(chatID int64, outageID string) (bool, error) {
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM sent_notifications WHERE chat_id = ? AND outage_id = ?", chatID, outageID).Scan(&count)
+	err := db.QueryRow("SELECT COUNT(*) FROM sent_notifications WHERE chat_id = $1 AND outage_id = $2", chatID, outageID).Scan(&count)
 	return count > 0, err
 }
 
 func markSent(chatID int64, outageID, street string) error {
-	_, err := db.Exec("INSERT OR IGNORE INTO sent_notifications (chat_id, outage_id, street) VALUES (?, ?, ?)", chatID, outageID, street)
+	_, err := db.Exec("INSERT INTO sent_notifications (chat_id, outage_id, street) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", chatID, outageID, street)
 	return err
 }
 
@@ -190,6 +235,35 @@ func notifyOutage(bot *tgbotapi.BotAPI, chatID int64, r ShutdownRecord) {
 	bot.Send(tgMsg)
 }
 
+var streetPrefixes = []string{
+	"ул ", "ул. ", "улица ",
+	"пр-кт ", "проспект ",
+	"пл ", "площадь ",
+	"пер ", "переулок ",
+	"ш ", "шоссе ",
+	"б-р ", "бульвар ",
+	"наб ", "набережная ",
+	"туп ", "тупик ",
+	"проезд ", "аллея ",
+	"мкр ", "микрорайон ",
+	"линия ",
+}
+
+func normalizeStreet(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	for _, p := range streetPrefixes {
+		if strings.HasPrefix(s, p) {
+			s = strings.TrimSpace(s[len(p):])
+			break
+		}
+	}
+	return s
+}
+
+func streetsMatch(a, b string) bool {
+	return normalizeStreet(a) == normalizeStreet(b)
+}
+
 func processOutages(bot *tgbotapi.BotAPI, records []ShutdownRecord) {
 	subs, err := getAllSubscriptions()
 	if err != nil {
@@ -198,13 +272,15 @@ func processOutages(bot *tgbotapi.BotAPI, records []ShutdownRecord) {
 	}
 
 	for chatID, streets := range subs {
-		streetLower := make(map[string]bool)
-		for _, s := range streets {
-			streetLower[strings.ToLower(s)] = true
-		}
-
 		for _, o := range records {
-			if !streetLower[strings.ToLower(o.Street)] {
+			matched := false
+			for _, s := range streets {
+				if streetsMatch(s, o.Street) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
 				continue
 			}
 			sent, err := isSent(chatID, o.ID)
@@ -222,20 +298,6 @@ func processOutages(bot *tgbotapi.BotAPI, records []ShutdownRecord) {
 			}
 		}
 	}
-}
-
-func filterKaybaly(records []ShutdownRecord) []ShutdownRecord {
-	raionLower := strings.ToLower(targetRaion)
-	gorodLower := strings.ToLower(targetGorod)
-	var result []ShutdownRecord
-	for _, r := range records {
-		if r.Region == targetRegion &&
-			strings.Contains(strings.ToLower(r.Raion), raionLower) &&
-			strings.Contains(strings.ToLower(r.Gorod), gorodLower) {
-			result = append(result, r)
-		}
-	}
-	return result
 }
 
 func handleOutagesWebhook(bot *tgbotapi.BotAPI) http.HandlerFunc {
@@ -304,21 +366,25 @@ func handleStreetsWebhook(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		_, err = tx.Exec("DELETE FROM streets WHERE region = ? AND raion = ? AND gorod = ?", s.Region, s.Raion, s.Gorod)
-		if err != nil {
+		if _, err = tx.Exec("DELETE FROM streets WHERE region = $1 AND raion = $2 AND gorod = $3", s.Region, s.Raion, s.Gorod); err != nil {
 			tx.Rollback()
-			log.Printf("delete streets: %v", err)
+			log.Printf("delete streets for %s/%s/%s: %v", s.Region, s.Raion, s.Gorod, err)
 			continue
 		}
 
+		ok := true
 		for _, street := range s.Streets {
-			_, err = tx.Exec("INSERT INTO streets (region, raion, gorod, street) VALUES (?, ?, ?, ?)", s.Region, s.Raion, s.Gorod, street)
-			if err != nil {
+			if _, err = tx.Exec("INSERT INTO streets (region, raion, gorod, street) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING", s.Region, s.Raion, s.Gorod, street); err != nil {
 				tx.Rollback()
-				log.Printf("insert street: %v", err)
-				continue
+				log.Printf("insert street %q: %v", street, err)
+				ok = false
+				break
 			}
 			total++
+		}
+
+		if !ok {
+			continue
 		}
 
 		if err := tx.Commit(); err != nil {
@@ -521,14 +587,16 @@ func handleCheckNow(bot *tgbotapi.BotAPI, chatID int64) {
 		return
 	}
 
-	streetLower := make(map[string]bool)
-	for _, s := range streets {
-		streetLower[strings.ToLower(s)] = true
-	}
-
 	var matched int
 	for _, o := range records {
-		if !streetLower[strings.ToLower(o.Street)] {
+		match := false
+		for _, s := range streets {
+			if streetsMatch(s, o.Street) {
+				match = true
+				break
+			}
+		}
+		if !match {
 			continue
 		}
 		sent, err := isSent(chatID, o.ID)
