@@ -13,9 +13,25 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	_ "modernc.org/sqlite"
-
-	"rosseti-bot/rosseti"
 )
+
+type ShutdownRecord struct {
+	ID         string `json:"id"`
+	Region     string `json:"region"`
+	Raion      string `json:"raion"`
+	Gorod      string `json:"gorod"`
+	Street     string `json:"street"`
+	DateStart  string `json:"date_start"`
+	DateFinish string `json:"date_finish"`
+	FOtkl      string `json:"f_otkl"`
+	Res        string `json:"res"`
+	TimeStart  string `json:"time_start"`
+	TimeFinish string `json:"time_finish"`
+}
+
+type OutagesPayload struct {
+	Outages []ShutdownRecord `json:"outages"`
+}
 
 const (
 	maxMsgLen  = 4096
@@ -27,7 +43,7 @@ const (
 var (
 	recordsCache struct {
 		mu      sync.RWMutex
-		records []rosseti.ShutdownRecord
+		records []ShutdownRecord
 	}
 	db *sql.DB
 )
@@ -136,7 +152,7 @@ func sendLong(bot *tgbotapi.BotAPI, chatID int64, text string) {
 	}
 }
 
-func notifyOutage(bot *tgbotapi.BotAPI, chatID int64, r rosseti.ShutdownRecord) {
+func notifyOutage(bot *tgbotapi.BotAPI, chatID int64, r ShutdownRecord) {
 	msg := fmt.Sprintf(`⚠️ <b>ОТКЛЮЧЕНИЕ ЭЛЕКТРОЭНЕРГИИ</b>
 
 📍 <b>%s</b>
@@ -154,7 +170,7 @@ func notifyOutage(bot *tgbotapi.BotAPI, chatID int64, r rosseti.ShutdownRecord) 
 	bot.Send(tgMsg)
 }
 
-func processOutages(bot *tgbotapi.BotAPI, records []rosseti.ShutdownRecord) {
+func processOutages(bot *tgbotapi.BotAPI, records []ShutdownRecord) {
 	subs, err := getAllSubscriptions()
 	if err != nil {
 		log.Printf("get subscriptions: %v", err)
@@ -188,10 +204,10 @@ func processOutages(bot *tgbotapi.BotAPI, records []rosseti.ShutdownRecord) {
 	}
 }
 
-func filterKaybaly(records []rosseti.ShutdownRecord) []rosseti.ShutdownRecord {
+func filterKaybaly(records []ShutdownRecord) []ShutdownRecord {
 	raionLower := strings.ToLower(targetRaion)
 	gorodLower := strings.ToLower(targetGorod)
-	var result []rosseti.ShutdownRecord
+	var result []ShutdownRecord
 	for _, r := range records {
 		if r.Region == targetRegion &&
 			strings.Contains(strings.ToLower(r.Raion), raionLower) &&
@@ -216,7 +232,7 @@ func handleOutagesWebhook(bot *tgbotapi.BotAPI) http.HandlerFunc {
 			return
 		}
 
-		var payload rosseti.OutagesPayload
+		var payload OutagesPayload
 		if err := json.Unmarshal(body, &payload); err != nil {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
@@ -319,7 +335,7 @@ func handleCheckNow(bot *tgbotapi.BotAPI, chatID int64) {
 	}
 
 	recordsCache.mu.RLock()
-	records := make([]rosseti.ShutdownRecord, len(recordsCache.records))
+	records := make([]ShutdownRecord, len(recordsCache.records))
 	copy(records, recordsCache.records)
 	recordsCache.mu.RUnlock()
 
