@@ -33,6 +33,17 @@ type OutagesPayload struct {
 	Outages []ShutdownRecord `json:"outages"`
 }
 
+type SettlementStreets struct {
+	Region  string   `json:"region"`
+	Raion   string   `json:"raion"`
+	Gorod   string   `json:"gorod"`
+	Streets []string `json:"streets"`
+}
+
+type StreetsPayload struct {
+	Settlements []SettlementStreets `json:"settlements"`
+}
+
 const (
 	maxMsgLen  = 4096
 	targetRegion = "19"
@@ -69,6 +80,15 @@ func initDB() error {
 			street TEXT NOT NULL,
 			sent_at TEXT NOT NULL DEFAULT (datetime('now')),
 			UNIQUE(chat_id, outage_id)
+		);
+		CREATE TABLE IF NOT EXISTS streets (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			region TEXT NOT NULL,
+			raion TEXT NOT NULL,
+			gorod TEXT NOT NULL,
+			street TEXT NOT NULL,
+			updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(region, raion, gorod, street)
 		);
 	`)
 	if err != nil {
@@ -257,6 +277,60 @@ func handleOutagesWebhook(bot *tgbotapi.BotAPI) http.HandlerFunc {
 	}
 }
 
+func handleStreetsWebhook(w http.ResponseWriter, r *http.Request) {
+	apiKey := os.Getenv("PARSER_API_KEY")
+	if apiKey != "" && r.Header.Get("X-API-Key") != apiKey {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+
+	var payload StreetsPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+
+	total := 0
+	for _, s := range payload.Settlements {
+		tx, err := db.Begin()
+		if err != nil {
+			log.Printf("tx begin: %v", err)
+			continue
+		}
+
+		_, err = tx.Exec("DELETE FROM streets WHERE region = ? AND raion = ? AND gorod = ?", s.Region, s.Raion, s.Gorod)
+		if err != nil {
+			tx.Rollback()
+			log.Printf("delete streets: %v", err)
+			continue
+		}
+
+		for _, street := range s.Streets {
+			_, err = tx.Exec("INSERT INTO streets (region, raion, gorod, street) VALUES (?, ?, ?, ?)", s.Region, s.Raion, s.Gorod, street)
+			if err != nil {
+				tx.Rollback()
+				log.Printf("insert street: %v", err)
+				continue
+			}
+			total++
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("tx commit: %v", err)
+		}
+	}
+
+	log.Printf("Updated streets: %d records across %d settlements", total, len(payload.Settlements))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf(`{"ok":true,"total":%d}`, total)))
+}
+
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"ok":true}`))
 }
@@ -393,6 +467,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/outages", handleOutagesWebhook(bot))
+	mux.HandleFunc("POST /api/streets", handleStreetsWebhook)
 	mux.HandleFunc("GET /health", healthHandler)
 
 	go func() {
