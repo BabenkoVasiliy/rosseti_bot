@@ -61,7 +61,7 @@ var (
 
 func initDB() error {
 	var err error
-	db, err = sql.Open("sqlite", "data.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err = sql.Open("sqlite", "data.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)")
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
