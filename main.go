@@ -335,6 +335,54 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"ok":true}`))
 }
 
+func getAllStreets() ([]string, error) {
+	rows, err := db.Query("SELECT DISTINCT street FROM streets ORDER BY street")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var streets []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		streets = append(streets, s)
+	}
+	return streets, nil
+}
+
+func matchStreet(input string, streets []string) (string, bool) {
+	input = strings.ToLower(strings.TrimSpace(input))
+	if input == "" {
+		return "", false
+	}
+	for _, s := range streets {
+		if strings.ToLower(s) == input {
+			return s, true
+		}
+	}
+	var candidates []string
+	for _, s := range streets {
+		if strings.Contains(strings.ToLower(s), input) {
+			candidates = append(candidates, s)
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0], true
+	}
+	if len(candidates) > 1 {
+		best := candidates[0]
+		for _, c := range candidates[1:] {
+			if len(c) < len(best) {
+				best = c
+			}
+		}
+		return best, true
+	}
+	return "", false
+}
+
 func handleStart(bot *tgbotapi.BotAPI, chatID int64) {
 	text := `🔌 Бот отключений — д Кайбалы (Россети Сибирь)
 
@@ -350,18 +398,54 @@ func handleStart(bot *tgbotapi.BotAPI, chatID int64) {
 	bot.Send(tgbotapi.NewMessage(chatID, text))
 }
 
-func handleAdd(bot *tgbotapi.BotAPI, chatID int64, street string) {
-	street = strings.TrimSpace(street)
-	if street == "" {
+func handleAdd(bot *tgbotapi.BotAPI, chatID int64, input string) {
+	input = strings.TrimSpace(input)
+	if input == "" {
 		bot.Send(tgbotapi.NewMessage(chatID, "Укажите улицу. Пример: /add ул Ленина"))
 		return
 	}
-	if err := addSubscription(chatID, street); err != nil {
+
+	allStreets, err := getAllStreets()
+	if err != nil {
+		log.Printf("get streets: %v", err)
+		bot.Send(tgbotapi.NewMessage(chatID, "Ошибка справочника улиц."))
+		return
+	}
+
+	if len(allStreets) == 0 {
+		bot.Send(tgbotapi.NewMessage(chatID, "Справочник улиц пуст. Дождитесь загрузки данных парсером."))
+		return
+	}
+
+	matched, found := matchStreet(input, allStreets)
+	if !found {
+		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("❌ Улица «%s» не найдена в справочнике.", input)))
+		return
+	}
+
+	if strings.ToLower(matched) != strings.ToLower(input) {
+		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("🔍 Подобрано: «%s»", matched)))
+	}
+
+	if err := addSubscription(chatID, matched); err != nil {
 		log.Printf("add subscription: %v", err)
 		bot.Send(tgbotapi.NewMessage(chatID, "Ошибка."))
 		return
 	}
-	bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ «%s» добавлена", street)))
+
+	streets, err := getSubscriptions(chatID)
+	if err != nil {
+		log.Printf("get subscriptions: %v", err)
+		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ «%s» добавлена", matched)))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("✅ «%s» добавлена\n\n📋 Отслеживаемые (%d):\n", matched, len(streets)))
+	for _, s := range streets {
+		sb.WriteString(fmt.Sprintf("  • %s\n", s))
+	}
+	sendLong(bot, chatID, sb.String())
 }
 
 func handleRemove(bot *tgbotapi.BotAPI, chatID int64, street string) {
