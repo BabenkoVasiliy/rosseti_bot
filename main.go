@@ -388,14 +388,33 @@ func handleStart(bot *tgbotapi.BotAPI, chatID int64) {
 
 Команды:
 /add <улица> — подписаться
-	Пример: /add ул Ленина
 /remove <улица> — отписаться
 /list — мои улицы
+/streets — все доступные улицы
 /check — проверить отключения сейчас
 
 Бот получает данные от парсера и уведомляет
 при появлении отключений на ваших улицах.`
 	bot.Send(tgbotapi.NewMessage(chatID, text))
+}
+
+func handleStreetsCatalog(bot *tgbotapi.BotAPI, chatID int64) {
+	allStreets, err := getAllStreets()
+	if err != nil {
+		log.Printf("get streets: %v", err)
+		bot.Send(tgbotapi.NewMessage(chatID, "Ошибка справочника улиц."))
+		return
+	}
+	if len(allStreets) == 0 {
+		bot.Send(tgbotapi.NewMessage(chatID, "📭 Справочник улиц пуст. Дождитесь загрузки данных парсером."))
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📋 Доступные улицы (%d):\n\n", len(allStreets)))
+	for _, s := range allStreets {
+		sb.WriteString(fmt.Sprintf("  • %s\n", s))
+	}
+	sendLong(bot, chatID, sb.String())
 }
 
 func handleAdd(bot *tgbotapi.BotAPI, chatID int64, input string) {
@@ -581,6 +600,8 @@ func main() {
 				handleRemove(bot, chatID, args)
 			case "list":
 				handleList(bot, chatID)
+			case "streets":
+				handleStreetsCatalog(bot, chatID)
 			case "check":
 				handleCheckNow(bot, chatID)
 			}
